@@ -1,11 +1,35 @@
 from sentence_transformers import SentenceTransformer       # Embedding model
 from typing import List, Tuple, Dict
+from qdrant_client import QdrantClient, models
+import json
+import requests
 import logging
+import os
 import re
 
 _SENT_SPLIT_RE = re.compile(r"(?<=[.!?。！？；;])\s+|(?<=\n)\n+")
 _ENCODER_CACHE: Dict[str, SentenceTransformer] = {}
 EMBED_TEXT_BATCH_SIZE = 32
+_CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config.json")
+
+
+def _load_config(path: str = _CONFIG_PATH) -> Dict[str, str]:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError as exc:
+        raise ValueError(f"Missing config file: {path}") from exc
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Invalid JSON in config file: {path}") from exc
+
+def _get_qdrant_client(config: Dict[str, str]) -> QdrantClient:
+    url = config.get("qdrant_url", "").strip()
+    api_key = config.get("qdrant_api_key", "").strip()
+    if not url or not api_key:
+        raise ValueError("qdrant_url and qdrant_api_key must be set in config.json")
+    return QdrantClient(url=url, api_key=api_key)
+
+client = _get_qdrant_client(_load_config())
 
 def _get_encoder(model_name: str) -> SentenceTransformer:
     encoder = _ENCODER_CACHE.get(model_name)
@@ -52,35 +76,31 @@ def split_file_into_headings_and_sentence(file_path: str) -> List[Tuple[str, str
 
     return pairs
 
+def _embed_items(
+    encoder: SentenceTransformer,
+    items: List[str],
+) -> List[Tuple[str, List[float]]]:
+    if not items:
+        return []
+    vectors = encoder.encode(
+        items,
+        batch_size=EMBED_TEXT_BATCH_SIZE,
+        normalize_embeddings=True,
+    )
+    return [(item, vector.tolist()) for item, vector in zip(items, vectors, strict=True)]
+
 
 def embed_texts(
     lines: List[Tuple[str, str]],
     model: str = "all-MiniLM-L6-v2",
 ) -> Tuple[List[Tuple[str, List[float]]], List[Tuple[str, List[float]]]]:
     encoder = _get_encoder(model)
-    heading_embeddings: List[Tuple[str, List[float]]] = []
-    sentence_embeddings: List[Tuple[str, List[float]]] = []
 
     headings = [heading for heading, _ in lines if heading]
     sentences = [sentence for _, sentence in lines if sentence]
 
-    if headings:
-        heading_vectors = encoder.encode(
-            headings,
-            batch_size=EMBED_TEXT_BATCH_SIZE,
-            normalize_embeddings=True,
-        )
-        for heading, vector in zip(headings, heading_vectors, strict=True):
-            heading_embeddings.append((heading, vector.tolist()))
-
-    if sentences:
-        sentence_vectors = encoder.encode(
-            sentences,
-            batch_size=EMBED_TEXT_BATCH_SIZE,
-            normalize_embeddings=True,
-        )
-        for sentence, vector in zip(sentences, sentence_vectors, strict=True):
-            sentence_embeddings.append((sentence, vector.tolist()))
+    heading_embeddings = _embed_items(encoder, headings)
+    sentence_embeddings = _embed_items(encoder, sentences)
 
     return heading_embeddings, sentence_embeddings
 
@@ -103,4 +123,11 @@ def fixed_size_chunks(file_path: str, chunk_size: int = 400, overlap: int = 50) 
     
     return [text[i:i+chunk_size] for i in range(0, len(text), step)]
 
-def embed_chunks(chunklist: List[str], )
+def embed_chunks(
+        chunks: List[str], 
+        model: str = "all-MiniLM-L6-v2"
+        ) -> List[Tuple[str, List[float]]]:
+    encoder = _get_encoder(model)
+    return _embed_items(encoder, chunks)
+
+def
