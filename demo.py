@@ -27,12 +27,22 @@ class PdfSentence(TypedDict):
     sentence: str
 
 
+class PdfChunk(TypedDict):
+    source: str
+    chunk_id: int
+    page_start: int
+    page_end: int
+    heading: int
+    text: str
+
+
 class EmbeddedPdfSentence(TypedDict):
     source: str
     page_id: int
     heading: str
     sentence: str
     embedding: List[float]
+
 
 def _load_config(path: str = _CONFIG_PATH) -> Dict[str, str]:
     try:
@@ -174,6 +184,35 @@ def split_pdf_pages_into_sentences(pages: List[PdfPage]) -> List[PdfSentence]:
 
     return items
 
+def split_pdf_pages_into_chunks(pages: List[PdfPage], target_tokens: int = 500, overlaps: int = 80) -> List[PdfChunk]:
+    model = get_config().get("embed_model")
+    tokenizer = _get_encoder(model).tokenizer
+
+    chunks: List[PdfChunk] = []
+    current_heading = ""
+
+    chunk_token_count = 0
+
+    for page in pages:
+        text = page.get("text") or ""
+        page_id = page.get("page_id")
+        for line in text.splitlines():
+            if not line or not line.strip():
+                continue
+
+            if is_heading_title(line):
+                cunrrent_heading = line.strip("#").strip()
+                continue
+
+            tokenized_line = tokenizer.encode(line, add_special_tokens=False)
+            line_token_count = len(tokenized_line)
+
+
+
+
+
+    
+
 def _embed_items(
     encoder: SentenceTransformer,
     items: List[str],
@@ -259,6 +298,10 @@ def upsert_pdf_sentences(
         return
     
     cfg = get_config()
+    
+    if not collection_name:
+        _create_collection(collection_name, cfg.get("embed_model"))
+
     collection_name = collection_name or cfg.get("collection_name")
     client = _get_qdrant_client(cfg)
 
@@ -284,4 +327,5 @@ def index_pdf(pdf_path: str, collection_name: str | None = None, model: str | No
     sentence_items = split_pdf_pages_into_sentences(pages)
     embedded_items = embed_pdf_texts(sentence_items, model=model)
     upsert_pdf_sentences(embedded_items, collection_name=collection_name)
-    return f"upsert {len(embedded_items)} Points"
+    return len(embedded_items)
+
