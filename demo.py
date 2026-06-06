@@ -16,8 +16,23 @@ _CONFIG_CACHE: Dict[str, object] = {}
 
 class PdfPage(TypedDict):
     source: str
-    page: int
+    page_id: int
     text: str | None
+
+
+class PdfSentence(TypedDict):
+    source: str
+    page_id: int
+    heading: str
+    sentence: str
+
+
+class EmbeddedPdfSentence(TypedDict):
+    source: str
+    page_id: int
+    heading: str
+    sentence: str
+    embedding: List[float]
 
 def _load_config(path: str = _CONFIG_PATH) -> Dict[str, str]:
     try:
@@ -63,18 +78,39 @@ def get_config() -> Dict[str, object]:
     }
     return _CONFIG_CACHE
 
+def _create_collection(collection_name: str | None = None, model: str | None = None) -> None:
+    cfg = get_config()
+    collection_name = collection_name or cfg.get("collection_name")
+    model = model or cfg.get("embed_model")
+    client = _get_qdrant_client(cfg)
+
+    try:
+        client.get_collection(collection_name=collection_name)
+        return
+    except Exception:
+        pass
+
+    encoder = _get_encoder(model)
+    vector_size = encoder.get_embedding_dimension()
+
+    client.create_collection(
+        collection_name=collection_name,
+        vectors_config=VectorParams(size=vector_size, distance=models.Distance.DOT),
+    )
+
 def parse_pdf_to_pages(pdf_path: str) -> List[PdfPage]:
     try:
+        source_name = os.path.basename(pdf_path)
         with pymupdf.open(pdf_path) as doc:
             pages: List[PdfPage] = []
             for index, page in enumerate(doc, start=1):
                 text = page.get_text("text")
-                if text:
+                if text and text.strip():
                     text = text.strip()
                 pages.append({
-                    "source": pdf_path,
-                    "page": index,
-                    "text": text or "",
+                    "source": source_name,
+                    "page_id": index,
+                    "text": text,
                 })
             return pages
     except (ValueError, OSError, RuntimeError) as exc:
@@ -96,7 +132,7 @@ def is_heading_title(sentence: str) -> bool:
         return True
     return False
 
-def split_file_into_headings_and_sentence(file_path: str) -> List[Tuple[str, str]]:
+def split_text_into_headings_and_sentence(file_path: str) -> List[Tuple[str, str]]:
     try:
         with open(file_path, 'r', encoding='utf-8') as f:
             text = f.read()
@@ -116,6 +152,28 @@ def split_file_into_headings_and_sentence(file_path: str) -> List[Tuple[str, str
 
     return pairs
 
+def split_pdf_pages_into_sentences(pages: List[PdfPage]) -> List[PdfSentence]:
+    items: List[PdfSentence] = []
+    current_heading = ""
+
+    for page in pages:
+        page_text = page.get("text") or ""
+        for line in page_text.splitlines():
+            if is_heading_title(line):
+                current_heading = line.strip("#").strip()
+                continue
+            for sentence in split_into_sentences(line):
+                items.append(
+                    {
+                        "source": page["source"],
+                        "page_id": page["page_id"],
+                        "heading": current_heading,
+                        "sentence": sentence,
+                    }
+                )
+
+    return items
+
 def _embed_items(
     encoder: SentenceTransformer,
     items: List[str],
@@ -129,15 +187,43 @@ def _embed_items(
 def embed_texts(
     lines: List[Tuple[str, str]],
     model: str | None = None,
-) -> List[Tuple[str, List[float], str]]:
+) -> List[Tuple[str, str, List[float]]]:
+    """Embed a list of (heading, sentence) pairs and return
+    a list of tuples (heading, sentence, embedding).
+    """
     model = model or get_config().get("embed_model")
     encoder = _get_encoder(model)
 
-    headings = [heading for heading, sentence in lines if sentence]
-    sentences = [sentence for heading, sentence in lines if sentence]
+    sentence_items = [(heading, sentence) for heading, sentence in lines if sentence]
+    sentences = [s for (_, s) in sentence_items]
+    sentence_embeddings = _embed_items(encoder, sentences)
+
+    return [
+        (heading, sentence, embedding)
+        for (heading, sentence), (_, embedding) in zip(sentence_items, sentence_embeddings, strict=True)
+    ]
+
+def embed_pdf_texts(
+    lines: List[PdfSentence],
+    model: str | None = None,
+) -> List[EmbeddedPdfSentence]:
+    model = model or get_config().get("embed_model")
+    encoder = _get_encoder(model)
+
+    sentence_items = [item for item in lines if item["sentence"]]
+    sentences = [item["sentence"] for item in sentence_items]
     embeddings = _embed_items(encoder, sentences)
 
-    return [(sentence, embedding, heading) for (sentence, embedding), heading in zip(embeddings, headings, strict=True)]
+    return [
+        {
+            "source": item["source"],
+            "page_id": item["page_id"],
+            "heading": item["heading"],
+            "sentence": sentence,
+            "embedding": embedding,
+        }
+        for item, (sentence, embedding) in zip(sentence_items, embeddings, strict=True)
+    ]
 
 def fixed_size_chunks(file_path: str, chunk_size: int = 400, overlap: int = 50) -> List[str]:
     if chunk_size <= 0:
@@ -165,22 +251,37 @@ def embed_chunks(
     encoder = _get_encoder(model)
     return _embed_items(encoder, chunks)
 
-def _create_collection(collection_name: str | None = None, model: str | None = None) -> None:
+def upsert_pdf_sentences(
+    items: List[EmbeddedPdfSentence],
+    collection_name: str | None = None,
+) -> None:
+    if not items:
+        return
+    
     cfg = get_config()
     collection_name = collection_name or cfg.get("collection_name")
-    model = model or cfg.get("embed_model")
     client = _get_qdrant_client(cfg)
 
-    try:
-        client.get_collection(collection_name=collection_name)
-        return
-    except Exception:
-        pass
+    points = [
+        models.PointStruct(
+            id=f'{item["source"]}:{item["page_id"]}:{index}',
+            vector=item["embedding"],
+            payload={
+                "source": item["source"],
+                "page_id": item["page_id"],
+                "heading": item["heading"],
+                "sentence": item["sentence"],
+            },
+        )
+        for index, item in enumerate(items)
+    ]
 
-    encoder = _get_encoder(model)
-    vector_size = encoder.get_embedding_dimension()
+    client.upsert(collection_name=collection_name, points=points)
 
-    client.create_collection(
-        collection_name=collection_name,
-        vectors_config=VectorParams(size=vector_size, distance=models.Distance.DOT),
-    )
+
+def index_pdf(pdf_path: str, collection_name: str | None = None, model: str | None = None) -> int:
+    pages = parse_pdf_to_pages(pdf_path)
+    sentence_items = split_pdf_pages_into_sentences(pages)
+    embedded_items = embed_pdf_texts(sentence_items, model=model)
+    upsert_pdf_sentences(embedded_items, collection_name=collection_name)
+    return f"upsert {len(embedded_items)} Points"
