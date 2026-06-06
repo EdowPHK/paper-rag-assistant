@@ -1,8 +1,9 @@
 from sentence_transformers import SentenceTransformer       # Embedding model
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Dict, TypedDict
 from qdrant_client import QdrantClient, models
 from qdrant_client.models import VectorParams
 import json
+import pymupdf
 import requests
 import logging
 import os
@@ -12,6 +13,11 @@ _SENT_SPLIT_RE = re.compile(r"(?<=[.!?。！？；;])\s+|(?<=\n)\n+")
 _ENCODER_CACHE: Dict[str, SentenceTransformer] = {}
 _CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config.json")
 _CONFIG_CACHE: Dict[str, object] = {}
+
+class PdfPage(TypedDict):
+    source: str
+    page: int
+    text: str | None
 
 def _load_config(path: str = _CONFIG_PATH) -> Dict[str, str]:
     try:
@@ -56,6 +62,24 @@ def get_config() -> Dict[str, object]:
         "embed_text_batch_size": int(raw.get("embed_text_batch_size", 32)),
     }
     return _CONFIG_CACHE
+
+def parse_pdf_to_pages(pdf_path: str) -> List[PdfPage]:
+    try:
+        with pymupdf.open(pdf_path) as doc:
+            pages: List[PdfPage] = []
+            for index, page in enumerate(doc, start=1):
+                text = page.get_text("text")
+                if text:
+                    text = text.strip()
+                pages.append({
+                    "source": pdf_path,
+                    "page": index,
+                    "text": text or "",
+                })
+            return pages
+    except (ValueError, OSError, RuntimeError) as exc:
+        logging.getLogger(__name__).exception("Failed to parse PDF: %s", pdf_path)
+        raise ValueError(f"Cannot parse PDF: {pdf_path}") from exc
 
 def split_into_sentences(text: str) -> List[str]:
     return [s.strip() for s in _SENT_SPLIT_RE.split(text) if s and s.strip()]
@@ -105,17 +129,15 @@ def _embed_items(
 def embed_texts(
     lines: List[Tuple[str, str]],
     model: str | None = None,
-) -> Tuple[List[Tuple[str, List[float]]], List[Tuple[str, List[float]]]]:
+) -> List[Tuple[str, List[float], str]]:
     model = model or get_config().get("embed_model")
     encoder = _get_encoder(model)
 
-    headings = [heading for heading, _ in lines if heading]
-    sentences = [sentence for _, sentence in lines if sentence]
+    headings = [heading for heading, sentence in lines if sentence]
+    sentences = [sentence for heading, sentence in lines if sentence]
+    embeddings = _embed_items(encoder, sentences)
 
-    heading_embeddings = _embed_items(encoder, headings)
-    sentence_embeddings = _embed_items(encoder, sentences)
-
-    return heading_embeddings, sentence_embeddings
+    return [(sentence, embedding, heading) for (sentence, embedding), heading in zip(embeddings, headings, strict=True)]
 
 def fixed_size_chunks(file_path: str, chunk_size: int = 400, overlap: int = 50) -> List[str]:
     if chunk_size <= 0:
@@ -160,5 +182,5 @@ def _create_collection(collection_name: str | None = None, model: str | None = N
 
     client.create_collection(
         collection_name=collection_name,
-        vectors_config=VectorParams(size=vector_size, distance=models.Distance.COSINE),
+        vectors_config=VectorParams(size=vector_size, distance=models.Distance.DOT),
     )
