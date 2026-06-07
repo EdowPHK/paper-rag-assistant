@@ -189,28 +189,58 @@ def split_pdf_pages_into_chunks(pages: List[PdfPage], target_tokens: int = 500, 
     tokenizer = _get_encoder(model).tokenizer
 
     chunks: List[PdfChunk] = []
-    current_heading = ""
+    current_heading: str = ""
 
-    chunk_token_count = 0
+    chunk_token_count: int = 0
+    chunk_id: int
+    chunk_page_start: int
+    chunk_page_end: int
+    chunk_heading: str
+    chunk_text: List[str] = []
 
     for page in pages:
-        text = page.get("text") or ""
-        page_id = page.get("page_id")
+        page_id = page["page_id"]
+        text = page["text"]
         for line in text.splitlines():
             if not line or not line.strip():
                 continue
 
             if is_heading_title(line):
-                cunrrent_heading = line.strip("#").strip()
+                current_heading = line.strip("#").strip()
                 continue
 
             tokenized_line = tokenizer.encode(line, add_special_tokens=False)
             line_token_count = len(tokenized_line)
 
+            if line_token_count and chunk_token_count + line_token_count >= target_tokens:
+                chunks.append({
+                    "source": page["source"],
+                    "chunk_id": len(chunks),
+                    "page_start": chunk_page_start,
+                    "page_end": page_id,
+                    "heading": current_heading,
+                    "text": "\n".join(chunk_text)
+                })
+                chunk_text = []
+                chunk_token_count = 0
+                chunk_page_start = page_id
+                chunk_page_end = page_id
 
+            chunk_token_count += line_token_count
+            chunk_text.append(line)
+            chunk_page_end = page_id
+            
+        if chunk_text:
+            chunks.append({
+                "source": pages[0]["source"],
+                "chunk_id": len(chunks),
+                "page_start": chunk_page_start,
+                "page_end": chunk_page_end,
+                "heading": current_heading,
+                "text": "\n".join(chunk_text)
+            })
 
-
-
+    return chunks
     
 
 def _embed_items(
