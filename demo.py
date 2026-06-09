@@ -2,9 +2,9 @@ from sentence_transformers import SentenceTransformer       # Embedding model
 from typing import List, Tuple, Dict, TypedDict
 from qdrant_client import QdrantClient, models
 from qdrant_client.models import VectorParams
+import hashlib
 import json
 import pymupdf
-import requests
 import logging
 import os
 import re
@@ -29,10 +29,11 @@ class PdfSentence(TypedDict):
 
 class PdfChunk(TypedDict):
     source: str
-    chunk_id: int
+    chunk_id: str
+    chunk_index: int
     page_start: int
     page_end: int
-    heading: int
+    heading: str
     text: str
 
 
@@ -42,6 +43,24 @@ class EmbeddedPdfSentence(TypedDict):
     heading: str
     sentence: str
     embedding: List[float]
+
+
+class EmbeddedPdfChunk(TypedDict):
+    source: str
+    chunk_id: str
+    chunk_index: int
+    page_start: int
+    page_end: int
+    heading: str
+    text: str
+    embedding: List[float]
+
+
+class IndexResult(TypedDict):
+    source: str
+    pages: int
+    chunks: int
+    collection_name: str
 
 
 def _load_config(path: str = _CONFIG_PATH) -> Dict[str, str]:
@@ -85,13 +104,15 @@ def get_config() -> Dict[str, object]:
         "collection_name": raw.get("collection_name", "knowledge_base"),
         "embed_model": raw.get("embed_model", "all-MiniLM-L6-v2"),
         "embed_text_batch_size": int(raw.get("embed_text_batch_size", 32)),
+        "chunk_target_tokens": int(raw.get("chunk_target_tokens", 220)),
+        "chunk_overlap_tokens": int(raw.get("chunk_overlap_tokens", 40)),
     }
     return _CONFIG_CACHE
 
 def _create_collection(collection_name: str | None = None, model: str | None = None) -> None:
     cfg = get_config()
-    collection_name = collection_name or cfg.get("collection_name")
-    model = model or cfg.get("embed_model")
+    collection_name = str(collection_name or cfg.get("collection_name"))
+    model = str(model or cfg.get("embed_model"))
     client = _get_qdrant_client(cfg)
 
     try:
@@ -184,61 +205,111 @@ def split_pdf_pages_into_sentences(pages: List[PdfPage]) -> List[PdfSentence]:
 
     return items
 
-def split_pdf_pages_into_chunks(pages: List[PdfPage], target_tokens: int = 500, overlaps: int = 80) -> List[PdfChunk]:
-    model = get_config().get("embed_model")
+def _make_chunk_id(source: str, page_start: int, page_end: int, heading: str, text: str) -> str:
+    raw = f"{source}:{page_start}:{page_end}:{heading}:{text}"
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
+
+def split_pdf_pages_into_chunks(
+    pages: List[PdfPage],
+    target_tokens: int | None = None,
+    overlap_tokens: int | None = None,
+    model: str | None = None,
+) -> List[PdfChunk]:
+    cfg = get_config()
+    target_tokens = target_tokens or int(cfg.get("chunk_target_tokens", 220))
+    overlap_tokens = overlap_tokens if overlap_tokens is not None else int(cfg.get("chunk_overlap_tokens", 40))
+    if target_tokens <= 0:
+        raise ValueError("target_tokens must be a positive integer")
+    if overlap_tokens < 0:
+        raise ValueError("overlap_tokens must be a non-negative integer")
+    if overlap_tokens >= target_tokens:
+        raise ValueError("overlap_tokens must be smaller than target_tokens")
+
+    if not pages:
+        return []
+
+    model = str(model or cfg.get("embed_model"))
     tokenizer = _get_encoder(model).tokenizer
 
     chunks: List[PdfChunk] = []
     current_heading: str = ""
 
-    chunk_token_count: int = 0
-    chunk_id: int
-    chunk_page_start: int
-    chunk_page_end: int
-    chunk_heading: str
-    chunk_text: List[str] = []
+    chunk_token_ids: List[int] = []
+    chunk_page_start: int | None = None
+    chunk_page_end: int | None = None
+    chunk_heading: str = ""
+
+    def decode(token_ids: List[int]) -> str:
+        return tokenizer.decode(token_ids).strip()
+
+    def append_chunk(token_ids: List[int], page_start: int, page_end: int, heading: str) -> None:
+        text = decode(token_ids)
+        if not text:
+            return
+        source = pages[0]["source"]
+        chunks.append({
+            "source": source,
+            "chunk_id": _make_chunk_id(source, page_start, page_end, heading, text),
+            "chunk_index": len(chunks),
+            "page_start": page_start,
+            "page_end": page_end,
+            "heading": heading,
+            "text": text,
+        })
 
     for page in pages:
         page_id = page["page_id"]
-        text = page["text"]
+        text = page.get("text") or ""
         for line in text.splitlines():
-            if not line or not line.strip():
+            line = line.strip()
+            if not line:
                 continue
 
             if is_heading_title(line):
                 current_heading = line.strip("#").strip()
                 continue
 
-            tokenized_line = tokenizer.encode(line, add_special_tokens=False)
-            line_token_count = len(tokenized_line)
+            tokenized_line = tokenizer.encode(line + "\n", add_special_tokens=False)
+            if not tokenized_line:
+                continue
 
-            if line_token_count and chunk_token_count + line_token_count >= target_tokens:
-                chunks.append({
-                    "source": page["source"],
-                    "chunk_id": len(chunks),
-                    "page_start": chunk_page_start,
-                    "page_end": page_id,
-                    "heading": current_heading,
-                    "text": "\n".join(chunk_text)
-                })
-                chunk_text = []
-                chunk_token_count = 0
+            if len(tokenized_line) > target_tokens:
+                if chunk_token_ids and chunk_page_start is not None and chunk_page_end is not None:
+                    append_chunk(chunk_token_ids, chunk_page_start, chunk_page_end, chunk_heading)
+                    chunk_token_ids = []
+                    chunk_page_start = None
+                    chunk_page_end = None
+
+                start = 0
+                while start < len(tokenized_line):
+                    end = min(start + target_tokens, len(tokenized_line))
+                    append_chunk(tokenized_line[start:end], page_id, page_id, current_heading)
+                    if end == len(tokenized_line):
+                        break
+                    start = max(0, end - overlap_tokens)
+                continue
+
+            if chunk_page_start is None:
                 chunk_page_start = page_id
-                chunk_page_end = page_id
+                chunk_heading = current_heading
 
-            chunk_token_count += line_token_count
-            chunk_text.append(line)
+            if chunk_token_ids and len(chunk_token_ids) + len(tokenized_line) > target_tokens:
+                previous_page_end = chunk_page_end or page_id
+                append_chunk(chunk_token_ids, chunk_page_start, chunk_page_end or page_id, chunk_heading)
+                chunk_token_ids = chunk_token_ids[-overlap_tokens:] if overlap_tokens else []
+                chunk_page_start = previous_page_end if chunk_token_ids else page_id
+                chunk_page_end = page_id
+                chunk_heading = current_heading
+                if chunk_token_ids and len(chunk_token_ids) + len(tokenized_line) > target_tokens:
+                    chunk_token_ids = []
+                    chunk_page_start = page_id
+
+            chunk_token_ids.extend(tokenized_line)
             chunk_page_end = page_id
-            
-        if chunk_text:
-            chunks.append({
-                "source": pages[0]["source"],
-                "chunk_id": len(chunks),
-                "page_start": chunk_page_start,
-                "page_end": chunk_page_end,
-                "heading": current_heading,
-                "text": "\n".join(chunk_text)
-            })
+
+    if chunk_token_ids and chunk_page_start is not None and chunk_page_end is not None:
+        append_chunk(chunk_token_ids, chunk_page_start, chunk_page_end, chunk_heading)
 
     return chunks
     
@@ -320,6 +391,63 @@ def embed_chunks(
     encoder = _get_encoder(model)
     return _embed_items(encoder, chunks)
 
+
+def embed_pdf_chunks(
+    chunks: List[PdfChunk],
+    model: str | None = None,
+) -> List[EmbeddedPdfChunk]:
+    model = str(model or get_config().get("embed_model"))
+    encoder = _get_encoder(model)
+    chunk_items = [chunk for chunk in chunks if chunk["text"]]
+    embeddings = _embed_items(encoder, [chunk["text"] for chunk in chunk_items])
+    return [
+        {
+            "source": chunk["source"],
+            "chunk_id": chunk["chunk_id"],
+            "chunk_index": chunk["chunk_index"],
+            "page_start": chunk["page_start"],
+            "page_end": chunk["page_end"],
+            "heading": chunk["heading"],
+            "text": text,
+            "embedding": embedding,
+        }
+        for chunk, (text, embedding) in zip(chunk_items, embeddings, strict=True)
+    ]
+
+
+def upsert_pdf_chunks(
+    items: List[EmbeddedPdfChunk],
+    collection_name: str | None = None,
+    model: str | None = None,
+) -> None:
+    if not items:
+        return
+
+    cfg = get_config()
+    collection_name = str(collection_name or cfg.get("collection_name"))
+    model = str(model or cfg.get("embed_model"))
+    _create_collection(collection_name, model)
+    client = _get_qdrant_client(cfg)
+
+    points = [
+        models.PointStruct(
+            id=item["chunk_id"],
+            vector=item["embedding"],
+            payload={
+                "source": item["source"],
+                "chunk_id": item["chunk_id"],
+                "chunk_index": item["chunk_index"],
+                "page_start": item["page_start"],
+                "page_end": item["page_end"],
+                "heading": item["heading"],
+                "text": item["text"],
+            },
+        )
+        for item in items
+    ]
+
+    client.upsert(collection_name=collection_name, points=points)
+
 def upsert_pdf_sentences(
     items: List[EmbeddedPdfSentence],
     collection_name: str | None = None,
@@ -328,11 +456,8 @@ def upsert_pdf_sentences(
         return
     
     cfg = get_config()
-    
-    if not collection_name:
-        _create_collection(collection_name, cfg.get("embed_model"))
-
-    collection_name = collection_name or cfg.get("collection_name")
+    collection_name = str(collection_name or cfg.get("collection_name"))
+    _create_collection(collection_name, str(cfg.get("embed_model")))
     client = _get_qdrant_client(cfg)
 
     points = [
@@ -352,10 +477,17 @@ def upsert_pdf_sentences(
     client.upsert(collection_name=collection_name, points=points)
 
 
-def index_pdf(pdf_path: str, collection_name: str | None = None, model: str | None = None) -> int:
+def index_pdf(pdf_path: str, collection_name: str | None = None, model: str | None = None) -> IndexResult:
+    cfg = get_config()
+    collection_name = str(collection_name or cfg.get("collection_name"))
+    model = str(model or cfg.get("embed_model"))
     pages = parse_pdf_to_pages(pdf_path)
-    sentence_items = split_pdf_pages_into_sentences(pages)
-    embedded_items = embed_pdf_texts(sentence_items, model=model)
-    upsert_pdf_sentences(embedded_items, collection_name=collection_name)
-    return len(embedded_items)
-
+    chunks = split_pdf_pages_into_chunks(pages, model=model)
+    embedded_items = embed_pdf_chunks(chunks, model=model)
+    upsert_pdf_chunks(embedded_items, collection_name=collection_name, model=model)
+    return {
+        "source": os.path.basename(pdf_path),
+        "pages": len(pages),
+        "chunks": len(embedded_items),
+        "collection_name": collection_name,
+    }
