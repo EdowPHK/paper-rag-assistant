@@ -1,15 +1,18 @@
 from sentence_transformers import SentenceTransformer       # Embedding model
-from typing import List, Tuple, Dict, TypedDict
+from collections import Counter
+from typing import Any, List, Tuple, Dict, TypedDict
 from qdrant_client import QdrantClient, models
 from qdrant_client.models import VectorParams
 import hashlib
 import json
+import math
 import pymupdf
 import logging
 import os
 import re
 
 _SENT_SPLIT_RE = re.compile(r"(?<=[.!?。！？；;])\s+|(?<=\n)\n+")
+_RETRIEVAL_TOKEN_RE = re.compile(r"[A-Za-z0-9_]+")
 _ENCODER_CACHE: Dict[str, SentenceTransformer] = {}
 _CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config.json")
 _CONFIG_CACHE: Dict[str, object] = {}
@@ -63,6 +66,21 @@ class IndexResult(TypedDict):
     collection_name: str
 
 
+class RetrievalResult(TypedDict, total=False):
+    chunk_id: str
+    source: str
+    chunk_index: int
+    page_start: int
+    page_end: int
+    heading: str
+    text: str
+    score: float
+    vector_score: float
+    bm25_score: float
+    rrf_score: float
+    retrieval_source: str
+
+
 def _load_config(path: str = _CONFIG_PATH) -> Dict[str, str]:
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -79,15 +97,6 @@ def _get_qdrant_client(config: Dict[str, str]) -> QdrantClient:
         raise ValueError("qdrant_url and qdrant_api_key must be set in config.json")
     return QdrantClient(url=url, api_key=api_key)
 
-def _get_encoder(model_name: str) -> SentenceTransformer:
-    encoder = _ENCODER_CACHE.get(model_name)
-    if encoder is None:
-        try:
-            encoder = SentenceTransformer(model_name)
-        except Exception as exc:
-            raise ValueError(f"Failed to load SentenceTransformer model: {model_name}") from exc
-        _ENCODER_CACHE[model_name] = encoder
-    return encoder
 
 def get_config() -> Dict[str, object]:
     global _CONFIG_CACHE
@@ -97,7 +106,7 @@ def get_config() -> Dict[str, object]:
         raw = _load_config()
     except ValueError:
         raw = {}
-
+        
     _CONFIG_CACHE = {
         "qdrant_url": raw.get("qdrant_url", ""),
         "qdrant_api_key": raw.get("qdrant_api_key", ""),
@@ -108,6 +117,17 @@ def get_config() -> Dict[str, object]:
         "chunk_overlap_tokens": int(raw.get("chunk_overlap_tokens", 40)),
     }
     return _CONFIG_CACHE
+
+
+def _get_encoder(model_name: str) -> SentenceTransformer:
+    encoder = _ENCODER_CACHE.get(model_name)
+    if encoder is None:
+        try:
+            encoder = SentenceTransformer(model_name)
+        except Exception as exc:
+            raise ValueError(f"Failed to load SentenceTransformer model: {model_name}") from exc
+        _ENCODER_CACHE[model_name] = encoder
+    return encoder
 
 def _create_collection(collection_name: str | None = None, model: str | None = None) -> None:
     cfg = get_config()
@@ -447,6 +467,240 @@ def upsert_pdf_chunks(
     ]
 
     client.upsert(collection_name=collection_name, points=points)
+
+
+def _payload_to_retrieval_result(
+    payload: Dict[str, Any],
+    score: float,
+    retrieval_source: str,
+) -> RetrievalResult:
+    return {
+        "chunk_id": str(payload.get("chunk_id", "")),
+        "source": str(payload.get("source", "")),
+        "chunk_index": _payload_int(payload, "chunk_index"),
+        "page_start": _payload_int(payload, "page_start"),
+        "page_end": _payload_int(payload, "page_end"),
+        "heading": str(payload.get("heading", "")),
+        "text": str(payload.get("text", "")),
+        "score": float(score),
+        "retrieval_source": retrieval_source,
+    }
+
+
+def _point_to_retrieval_result(point: object, retrieval_source: str) -> RetrievalResult:
+    payload = getattr(point, "payload", None) or {}
+    score = float(getattr(point, "score", 0.0) or 0.0)
+    result = _payload_to_retrieval_result(payload, score, retrieval_source)
+    if not result["chunk_id"]:
+        result["chunk_id"] = str(getattr(point, "id", ""))
+    return result
+
+
+def _payload_int(payload: Dict[str, Any], key: str, default: int = 0) -> int:
+    value = payload.get(key, default)
+    if value is None:
+        return default
+    return int(value)
+
+
+def _payload_to_pdf_chunk(payload: Dict[str, Any]) -> PdfChunk:
+    return {
+        "source": str(payload.get("source", "")),
+        "chunk_id": str(payload.get("chunk_id", "")),
+        "chunk_index": _payload_int(payload, "chunk_index"),
+        "page_start": _payload_int(payload, "page_start"),
+        "page_end": _payload_int(payload, "page_end"),
+        "heading": str(payload.get("heading", "")),
+        "text": str(payload.get("text", "")),
+    }
+
+
+def _query_qdrant(
+    client: QdrantClient,
+    collection_name: str,
+    query_vector: List[float],
+    top_k: int,
+) -> List[object]:
+    if hasattr(client, "search"):
+        return client.search(
+            collection_name=collection_name,
+            query_vector=query_vector,
+            limit=top_k,
+            with_payload=True,
+        )
+
+    response = client.query_points(
+        collection_name=collection_name,
+        query=query_vector,
+        limit=top_k,
+        with_payload=True,
+    )
+    return list(getattr(response, "points", response))
+
+
+def list_indexed_pdf_chunks(
+    collection_name: str | None = None,
+    limit: int = 1000,
+) -> List[PdfChunk]:
+    if limit <= 0:
+        raise ValueError("limit must be a positive integer")
+
+    cfg = get_config()
+    collection_name = str(collection_name or cfg.get("collection_name"))
+    client = _get_qdrant_client(cfg)
+    if not hasattr(client, "scroll"):
+        raise ValueError("Qdrant client does not support scroll")
+
+    chunks: List[PdfChunk] = []
+    offset = None
+    while True:
+        records, offset = client.scroll(
+            collection_name=collection_name,
+            limit=limit,
+            offset=offset,
+            with_payload=True,
+            with_vectors=False,
+        )
+        for record in records:
+            payload = getattr(record, "payload", None) or {}
+            chunk = _payload_to_pdf_chunk(payload)
+            if chunk["chunk_id"] and chunk["text"]:
+                chunks.append(chunk)
+        if offset is None:
+            break
+
+    return chunks
+
+
+def search_pdf_chunks(
+    query: str,
+    top_k: int = 5,
+    collection_name: str | None = None,
+    model: str | None = None,
+) -> List[RetrievalResult]:
+    if top_k <= 0:
+        raise ValueError("top_k must be a positive integer")
+
+    cfg = get_config()
+    collection_name = str(collection_name or cfg.get("collection_name"))
+    model = str(model or cfg.get("embed_model"))
+    encoder = _get_encoder(model)
+    query_vector = encoder.encode([query], normalize_embeddings=True)[0].tolist()
+    client = _get_qdrant_client(cfg)
+    points = _query_qdrant(client, collection_name, query_vector, top_k)
+    return [_point_to_retrieval_result(point, "vector") for point in points]
+
+
+def _tokenize_for_retrieval(text: str) -> List[str]:
+    return [token.lower() for token in _RETRIEVAL_TOKEN_RE.findall(text)]
+
+
+def bm25_search_chunks(
+    query: str,
+    chunks: List[PdfChunk],
+    top_k: int = 5,
+    k1: float = 1.5,
+    b: float = 0.75,
+) -> List[RetrievalResult]:
+    if top_k <= 0:
+        raise ValueError("top_k must be a positive integer")
+    if not chunks:
+        return []
+
+    tokenized_docs = [_tokenize_for_retrieval(chunk["text"]) for chunk in chunks]
+    query_terms = _tokenize_for_retrieval(query)
+    if not query_terms:
+        return []
+
+    doc_count = len(tokenized_docs)
+    avg_doc_len = sum(len(doc) for doc in tokenized_docs) / doc_count
+    document_frequency: Counter[str] = Counter()
+    for doc in tokenized_docs:
+        document_frequency.update(set(doc))
+
+    scored: List[RetrievalResult] = []
+    for chunk, doc_tokens in zip(chunks, tokenized_docs, strict=True):
+        if not doc_tokens:
+            continue
+
+        term_frequency = Counter(doc_tokens)
+        score = 0.0
+        doc_len = len(doc_tokens)
+        for term in query_terms:
+            tf = term_frequency.get(term, 0)
+            if not tf:
+                continue
+            df = document_frequency.get(term, 0)
+            idf = math.log(1 + (doc_count - df + 0.5) / (df + 0.5))
+            denominator = tf + k1 * (1 - b + b * doc_len / avg_doc_len)
+            score += idf * (tf * (k1 + 1)) / denominator
+
+        if score <= 0:
+            continue
+        scored.append({
+            "chunk_id": chunk["chunk_id"],
+            "source": chunk["source"],
+            "chunk_index": chunk["chunk_index"],
+            "page_start": chunk["page_start"],
+            "page_end": chunk["page_end"],
+            "heading": chunk["heading"],
+            "text": chunk["text"],
+            "score": score,
+            "bm25_score": score,
+            "retrieval_source": "bm25",
+        })
+
+    return sorted(scored, key=lambda item: item["score"], reverse=True)[:top_k]
+
+
+def rrf_fuse_results(
+    ranked_lists: List[List[RetrievalResult]],
+    top_k: int = 5,
+    k: int = 60,
+) -> List[RetrievalResult]:
+    if top_k <= 0:
+        raise ValueError("top_k must be a positive integer")
+    if k <= 0:
+        raise ValueError("k must be a positive integer")
+
+    fused: Dict[str, RetrievalResult] = {}
+    for ranked in ranked_lists:
+        for rank, result in enumerate(ranked, start=1):
+            chunk_id = result["chunk_id"]
+            if chunk_id not in fused:
+                fused[chunk_id] = dict(result)
+                fused[chunk_id]["rrf_score"] = 0.0
+                fused[chunk_id]["retrieval_source"] = "hybrid"
+            fused[chunk_id]["rrf_score"] = float(fused[chunk_id].get("rrf_score", 0.0)) + 1 / (k + rank)
+            if result.get("retrieval_source") == "vector":
+                fused[chunk_id]["vector_score"] = float(result.get("score", 0.0))
+            if result.get("retrieval_source") == "bm25":
+                fused[chunk_id]["bm25_score"] = float(result.get("score", 0.0))
+
+    results = list(fused.values())
+    for result in results:
+        result["score"] = float(result.get("rrf_score", 0.0))
+    return sorted(results, key=lambda item: item["score"], reverse=True)[:top_k]
+
+
+def hybrid_search_pdf_chunks(
+    query: str,
+    chunks: List[PdfChunk] | None = None,
+    top_k: int = 5,
+    collection_name: str | None = None,
+    model: str | None = None,
+) -> List[RetrievalResult]:
+    if chunks is None:
+        chunks = list_indexed_pdf_chunks(collection_name=collection_name)
+    vector_results = search_pdf_chunks(
+        query=query,
+        top_k=top_k,
+        collection_name=collection_name,
+        model=model,
+    )
+    bm25_results = bm25_search_chunks(query=query, chunks=chunks, top_k=top_k)
+    return rrf_fuse_results([vector_results, bm25_results], top_k=top_k)
+
 
 def upsert_pdf_sentences(
     items: List[EmbeddedPdfSentence],

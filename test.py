@@ -55,6 +55,42 @@ class FakeEncoder:
     tokenizer = FakeTokenizer()
 
 
+class FakeRecord:
+    def __init__(self, payload: dict) -> None:
+        self.payload = payload
+
+
+class FakeScrollClient:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def scroll(
+        self,
+        collection_name: str,
+        limit: int,
+        offset: object,
+        with_payload: bool,
+        with_vectors: bool,
+    ) -> tuple[list[FakeRecord], object]:
+        self.calls += 1
+        return (
+            [
+                FakeRecord(
+                    {
+                        "source": "paper.pdf",
+                        "chunk_id": "chunk-a",
+                        "chunk_index": 0,
+                        "page_start": 1,
+                        "page_end": 1,
+                        "heading": "Intro",
+                        "text": "retrieval augmented generation",
+                    }
+                )
+            ],
+            None,
+        )
+
+
 class ChunkingTests(unittest.TestCase):
     def test_split_pdf_pages_into_chunks_uses_heading_and_token_window(self) -> None:
         pages = [
@@ -88,6 +124,65 @@ class ChunkingTests(unittest.TestCase):
     def test_split_pdf_pages_into_chunks_rejects_invalid_overlap(self) -> None:
         with self.assertRaises(ValueError):
             demo.split_pdf_pages_into_chunks([], target_tokens=10, overlap_tokens=10, model="fake-model")
+
+
+class RetrievalTests(unittest.TestCase):
+    def test_bm25_search_chunks_ranks_keyword_matches(self) -> None:
+        chunks = [
+            {
+                "source": "paper.pdf",
+                "chunk_id": "a",
+                "chunk_index": 0,
+                "page_start": 1,
+                "page_end": 1,
+                "heading": "Introduction",
+                "text": "retrieval augmented generation improves grounded answers",
+            },
+            {
+                "source": "paper.pdf",
+                "chunk_id": "b",
+                "chunk_index": 1,
+                "page_start": 2,
+                "page_end": 2,
+                "heading": "Experiments",
+                "text": "optimizer learning rate batch size baseline",
+            },
+        ]
+
+        results = demo.bm25_search_chunks("retrieval generation", chunks, top_k=2)
+
+        self.assertEqual(results[0]["chunk_id"], "a")
+        self.assertEqual(results[0]["retrieval_source"], "bm25")
+        self.assertGreater(results[0]["score"], 0)
+
+    def test_rrf_fuse_results_prefers_items_appearing_in_multiple_rankings(self) -> None:
+        vector_results = [
+            {"chunk_id": "a", "text": "vector only", "score": 0.90, "retrieval_source": "vector"},
+            {"chunk_id": "b", "text": "shared", "score": 0.80, "retrieval_source": "vector"},
+        ]
+        bm25_results = [
+            {"chunk_id": "b", "text": "shared", "score": 3.0, "retrieval_source": "bm25"},
+            {"chunk_id": "c", "text": "keyword only", "score": 2.0, "retrieval_source": "bm25"},
+        ]
+
+        fused = demo.rrf_fuse_results([vector_results, bm25_results], top_k=3, k=10)
+
+        self.assertEqual(fused[0]["chunk_id"], "b")
+        self.assertEqual(fused[0]["retrieval_source"], "hybrid")
+        self.assertIn("vector_score", fused[0])
+        self.assertIn("bm25_score", fused[0])
+        self.assertIn("rrf_score", fused[0])
+
+    def test_list_indexed_pdf_chunks_reads_qdrant_payloads(self) -> None:
+        fake_client = FakeScrollClient()
+
+        with patch.object(demo, "_get_qdrant_client", return_value=fake_client):
+            chunks = demo.list_indexed_pdf_chunks(collection_name="knowledge_base", limit=10)
+
+        self.assertEqual(fake_client.calls, 1)
+        self.assertEqual(chunks[0]["chunk_id"], "chunk-a")
+        self.assertEqual(chunks[0]["text"], "retrieval augmented generation")
+        self.assertEqual(chunks[0]["page_start"], 1)
 
 
 if __name__ == "__main__":
