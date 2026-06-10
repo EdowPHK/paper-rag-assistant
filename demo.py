@@ -1,4 +1,4 @@
-from sentence_transformers import SentenceTransformer       # Embedding model
+from sentence_transformers import SentenceTransformer, CrossEncoder
 from collections import Counter
 from typing import Any, List, Tuple, Dict, TypedDict
 from qdrant_client import QdrantClient, models
@@ -14,6 +14,7 @@ import re
 _SENT_SPLIT_RE = re.compile(r"(?<=[.!?。！？；;])\s+|(?<=\n)\n+")
 _RETRIEVAL_TOKEN_RE = re.compile(r"[A-Za-z0-9_]+")
 _ENCODER_CACHE: Dict[str, SentenceTransformer] = {}
+_RERANKER_CACHE: Dict[str, CrossEncoder] = {}
 _CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config.json")
 _CONFIG_CACHE: Dict[str, object] = {}
 
@@ -81,6 +82,19 @@ class RetrievalResult(TypedDict, total=False):
     retrieval_source: str
 
 
+class RerankedResult(TypedDict):
+    chunk_id: str
+    source: str
+    chunk_index: int
+    page_start: int
+    page_end: int
+    heading: str
+    text: str
+    score: float
+    rerank_score: float
+    retrieval_source: str
+
+
 def _load_config(path: str = _CONFIG_PATH) -> Dict[str, str]:
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -128,6 +142,16 @@ def _get_encoder(model_name: str) -> SentenceTransformer:
             raise ValueError(f"Failed to load SentenceTransformer model: {model_name}") from exc
         _ENCODER_CACHE[model_name] = encoder
     return encoder
+
+def _get_reranker(model_name: str) -> CrossEncoder:
+    reranker = _RERANKER_CACHE.get(model_name)
+    if reranker is None:
+        try:
+            reranker = CrossEncoder(model_name)
+        except Exception as exc:
+            raise ValueError(f"Failed to load CrossEncoder model:{model_name}") from exc
+        _RERANKER_CACHE[model_name] = reranker
+    return reranker
 
 def _create_collection(collection_name: str | None = None, model: str | None = None) -> None:
     cfg = get_config()
@@ -702,6 +726,38 @@ def hybrid_search_pdf_chunks(
     return rrf_fuse_results([vector_results, bm25_results], top_k=top_k)
 
 
+def rerank(
+    query: str,
+    candidates: List[RetrievalResult],
+    top_k: int = 5,
+    model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+) -> List[RerankedResult]:
+    if top_k <= 0:
+        raise ValueError("top_k must be a positive integer")
+    if not candidates:
+        return []
+    
+    cfg = get_config()
+    model = str(model or cfg.get("cross_encoder_model"))
+    reranker = _get_reranker(model)
+
+    pairs = [(query, item["text"]) for item in candidates if item.get("text")]
+    reranked = []
+
+    scores = reranker.predict(pairs)
+
+    for item, score in zip(candidates, scores, strict=True):
+        result = dict(item)
+        result["rerank_score"] = score
+        result["score"] = score
+        result["retrieval_source"] = "rerank"
+        reranked.append(result)
+
+    reranked.sort(key=lambda item: item["rerank_score"], reverse=True)
+
+    return reranked[:top_k]
+
+
 def upsert_pdf_sentences(
     items: List[EmbeddedPdfSentence],
     collection_name: str | None = None,
@@ -745,3 +801,4 @@ def index_pdf(pdf_path: str, collection_name: str | None = None, model: str | No
         "chunks": len(embedded_items),
         "collection_name": collection_name,
     }
+
