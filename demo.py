@@ -758,6 +758,20 @@ def rerank(
     return reranked[:top_k]
 
 
+def retrieve_with_rerank(
+    query: str,
+    chunks: List[PdfChunk] | None = None,
+    top_k: int = 5,
+    candidate_k: int = 20,
+    collection_name: str | None = None,
+    model: str | None = None,
+    rerank_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+) -> List[RerankedResult]:
+    candidates = hybrid_search_pdf_chunks(query, chunks, candidate_k, collection_name, model)
+    rerank_results = rerank(query, candidates, top_k, rerank_model)
+
+    return rerank_results
+
 def upsert_pdf_sentences(
     items: List[EmbeddedPdfSentence],
     collection_name: str | None = None,
