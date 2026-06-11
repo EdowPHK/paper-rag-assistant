@@ -18,7 +18,6 @@ _ENCODER_CACHE: Dict[str, SentenceTransformer] = {}
 _RERANKER_CACHE: Dict[str, CrossEncoder] = {}
 _CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config.json")
 _CONFIG_CACHE: Dict[str, object] = {}
-_DEFAULT_RERANK_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 
 class PdfPage(TypedDict):
     source: str

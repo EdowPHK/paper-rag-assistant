@@ -1,0 +1,23 @@
+paper_rag_assistant/
+  config.py
+  types.py
+  parsing/
+    pymupdf_parser.py
+  chunking.py
+  embeddings.py
+  vector_store.py
+  retrieval/
+    vector.py
+    bm25.py
+    rrf.py
+    reranker.py
+  generation/
+    prompt.py
+    llm.py
+    answer.py
+  pipeline.py
+
+tests/
+  test_chunking.py
+  test_retrieval.py
+  test_generation.py
