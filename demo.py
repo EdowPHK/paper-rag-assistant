@@ -3,6 +3,7 @@ from collections import Counter
 from typing import Any, List, Tuple, Dict, TypedDict
 from qdrant_client import QdrantClient, models
 from qdrant_client.models import VectorParams
+from openai import OpenAI
 import hashlib
 import json
 import math
@@ -111,27 +112,31 @@ def _get_qdrant_client(config: Dict[str, str]) -> QdrantClient:
         raise ValueError("qdrant_url and qdrant_api_key must be set in config.json")
     return QdrantClient(url=url, api_key=api_key)
 
+def _create_collection(collection_name: str | None = None, model: str | None = None) -> None:
+    cfg = get_config()
+    collection_name = str(collection_name or cfg.get("collection_name"))
+    model = str(model or cfg.get("embed_model"))
+    client = _get_qdrant_client(cfg)
 
-def get_config() -> Dict[str, object]:
-    global _CONFIG_CACHE
-    if _CONFIG_CACHE:
-        return _CONFIG_CACHE
     try:
-        raw = _load_config()
-    except ValueError:
-        raw = {}
-        
-    _CONFIG_CACHE = {
-        "qdrant_url": raw.get("qdrant_url", ""),
-        "qdrant_api_key": raw.get("qdrant_api_key", ""),
-        "collection_name": raw.get("collection_name", "knowledge_base"),
-        "embed_model": raw.get("embed_model", "all-MiniLM-L6-v2"),
-        "embed_text_batch_size": int(raw.get("embed_text_batch_size", 32)),
-        "chunk_target_tokens": int(raw.get("chunk_target_tokens", 220)),
-        "chunk_overlap_tokens": int(raw.get("chunk_overlap_tokens", 40)),
-    }
-    return _CONFIG_CACHE
+        client.get_collection(collection_name=collection_name)
+        return
+    except Exception:
+        pass
 
+    encoder = _get_encoder(model)
+    vector_size = encoder.get_embedding_dimension()
+
+    client.create_collection(
+        collection_name=collection_name,
+        vectors_config=VectorParams(size=vector_size, distance=models.Distance.DOT),
+    )
+
+def get_qdrant_apikey() -> str:
+    api_key = os.getenv("QDRANT_API_KEY", "").strip()
+    if not api_key:
+        raise ValueError("QDRANT_API_KEY must be set.")
+    return api_key
 
 def _get_encoder(model_name: str) -> SentenceTransformer:
     encoder = _ENCODER_CACHE.get(model_name)
@@ -153,25 +158,31 @@ def _get_reranker(model_name: str) -> CrossEncoder:
         _RERANKER_CACHE[model_name] = reranker
     return reranker
 
-def _create_collection(collection_name: str | None = None, model: str | None = None) -> None:
-    cfg = get_config()
-    collection_name = str(collection_name or cfg.get("collection_name"))
-    model = str(model or cfg.get("embed_model"))
-    client = _get_qdrant_client(cfg)
-
+def get_config() -> Dict[str, object]:
+    global _CONFIG_CACHE
+    if _CONFIG_CACHE:
+        return _CONFIG_CACHE
     try:
-        client.get_collection(collection_name=collection_name)
-        return
-    except Exception:
-        pass
-
-    encoder = _get_encoder(model)
-    vector_size = encoder.get_embedding_dimension()
-
-    client.create_collection(
-        collection_name=collection_name,
-        vectors_config=VectorParams(size=vector_size, distance=models.Distance.DOT),
-    )
+        raw = _load_config()
+    except ValueError:
+        raw = {}
+        
+    _CONFIG_CACHE = {
+        "qdrant_url": raw.get("qdrant_url", ""),
+        "qdrant_api_key": get_qdrant_apikey(),
+        "collection_name": raw.get("collection_name", ""),
+        "embed_model": raw.get("embed_model", "all-MiniLM-L6-v2"),
+        "embed_text_batch_size": int(raw.get("embed_text_batch_size", 32)),
+        "chunk_target_tokens": int(raw.get("chunk_target_tokens", 220)),
+        "chunk_overlap_tokens": int(raw.get("chunk_overlap_tokens", 40)),
+        "rerank_model": str(raw.get("rerank_model", "")),
+        "rerank_candidate_k": int(raw.get("rerank_candidate_k", 20)),
+        "rerank_top_k": int(raw.get("rerank_top_k", 5)),
+        "llm_model": str(raw.get("llm_model", "")),
+        "llm_api_key_env": str(raw.get("llm_api_key", "")),
+        "llm_url": str(raw.get("llm_url", "")),
+    }
+    return _CONFIG_CACHE
 
 def parse_pdf_to_pages(pdf_path: str) -> List[PdfPage]:
     try:
@@ -880,4 +891,24 @@ Answer:
     return prompt
 
 def call_llm(prompt: str) -> None:
-    
+    cfg = get_config()
+
+    base_url = str(cfg.get("llm_url", ""))
+    model = str(cfg.get("llm_model", ""))
+    llm_api_key_env = str(cfg.get("llm_api_key_env", ""))
+
+    api_key = os.getenv(llm_api_key_env, "")
+    if not api_key:
+        raise ValueError(f"{llm_api_key_env} must be set.")
+
+    client = OpenAI(
+        base_url=base_url,
+        api_key=api_key,
+    )
+
+    response = client.responses.create(
+        model=cfg.get("llm_model"),
+        input=[{"role": "user", "content": prompt,}],
+    )
+
+    return response.output_text
