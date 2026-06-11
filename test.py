@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 sentence_transformers = types.ModuleType("sentence_transformers")
 sentence_transformers.SentenceTransformer = object
+sentence_transformers.CrossEncoder = object
 sys.modules.setdefault("sentence_transformers", sentence_transformers)
 
 qdrant_client = types.ModuleType("qdrant_client")
@@ -39,6 +40,10 @@ sys.modules.setdefault("qdrant_client.models", qdrant_models)
 
 pymupdf = types.ModuleType("pymupdf")
 sys.modules.setdefault("pymupdf", pymupdf)
+
+openai = types.ModuleType("openai")
+openai.OpenAI = object
+sys.modules.setdefault("openai", openai)
 
 import demo
 

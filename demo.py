@@ -18,6 +18,7 @@ _ENCODER_CACHE: Dict[str, SentenceTransformer] = {}
 _RERANKER_CACHE: Dict[str, CrossEncoder] = {}
 _CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config.json")
 _CONFIG_CACHE: Dict[str, object] = {}
+_DEFAULT_RERANK_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 
 class PdfPage(TypedDict):
     source: str
@@ -96,6 +97,21 @@ class RerankedResult(TypedDict):
     retrieval_source: str
 
 
+class AnswerSource(TypedDict, total=False):
+    source: str
+    chunk_index: int
+    page_start: int
+    page_end: int
+    heading: str
+    score: float
+    retrieval_source: str
+
+
+class AnswerResult(TypedDict):
+    query: str
+    answer: str
+    sources: List[AnswerSource]
+
 def _load_config(path: str = _CONFIG_PATH) -> Dict[str, str]:
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -133,10 +149,7 @@ def _create_collection(collection_name: str | None = None, model: str | None = N
     )
 
 def get_qdrant_apikey() -> str:
-    api_key = os.getenv("QDRANT_API_KEY", "").strip()
-    if not api_key:
-        raise ValueError("QDRANT_API_KEY must be set.")
-    return api_key
+    return os.getenv("QDRANT_API_KEY", "").strip()
 
 def _get_encoder(model_name: str) -> SentenceTransformer:
     encoder = _ENCODER_CACHE.get(model_name)
@@ -170,17 +183,18 @@ def get_config() -> Dict[str, object]:
     _CONFIG_CACHE = {
         "qdrant_url": raw.get("qdrant_url", ""),
         "qdrant_api_key": get_qdrant_apikey(),
-        "collection_name": raw.get("collection_name", ""),
+        "collection_name": raw.get("collection_name", "knowledge_base"),
         "embed_model": raw.get("embed_model", "all-MiniLM-L6-v2"),
         "embed_text_batch_size": int(raw.get("embed_text_batch_size", 32)),
         "chunk_target_tokens": int(raw.get("chunk_target_tokens", 220)),
         "chunk_overlap_tokens": int(raw.get("chunk_overlap_tokens", 40)),
-        "rerank_model": str(raw.get("rerank_model", "")),
+        "rerank_model": str(raw.get("rerank_model", _DEFAULT_RERANK_MODEL)),
         "rerank_candidate_k": int(raw.get("rerank_candidate_k", 20)),
         "rerank_top_k": int(raw.get("rerank_top_k", 5)),
-        "llm_model": str(raw.get("llm_model", "")),
-        "llm_api_key_env": str(raw.get("llm_api_key", "")),
-        "llm_url": str(raw.get("llm_url", "")),
+        "max_context_chars": int(raw.get("max_context_chars", 6000)),
+        "llm_model": str(raw.get("llm_model", "deepseek-chat")),
+        "llm_api_key_env": str(raw.get("llm_api_key_env", "DEEPSEEK_API_KEY")),
+        "llm_url": str(raw.get("llm_url", raw.get("llm_base_url", "https://api.deepseek.com"))),
     }
     return _CONFIG_CACHE
 
@@ -386,7 +400,7 @@ def embed_texts(
     """Embed a list of (heading, sentence) pairs and return
     a list of tuples (heading, sentence, embedding).
     """
-    model = model or get_config().get("embed_model")
+    model = str(model or get_config().get("embed_model"))
     encoder = _get_encoder(model)
 
     sentence_items = [(heading, sentence) for heading, sentence in lines if sentence]
@@ -402,7 +416,7 @@ def embed_pdf_texts(
     lines: List[PdfSentence],
     model: str | None = None,
 ) -> List[EmbeddedPdfSentence]:
-    model = model or get_config().get("embed_model")
+    model = str(model or get_config().get("embed_model"))
     encoder = _get_encoder(model)
 
     sentence_items = [item for item in lines if item["sentence"]]
@@ -442,7 +456,7 @@ def embed_chunks(
         chunks: List[str], 
         model: str | None = None,
         ) -> List[Tuple[str, List[float]]]:
-    model = model or get_config().get("embed_model")
+    model = str(model or get_config().get("embed_model"))
     encoder = _get_encoder(model)
     return _embed_items(encoder, chunks)
 
@@ -785,27 +799,30 @@ def hybrid_search_pdf_chunks(
 def rerank(
     query: str,
     candidates: List[RetrievalResult],
-    top_k: int = 5,
-    model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+    top_k: int | None = None,
+    rerank_model: str | None = None,
 ) -> List[RerankedResult]:
+    cfg = get_config()
+    top_k = top_k if top_k is not None else int(cfg.get("rerank_top_k", 5))
+    rerank_model = str(rerank_model or cfg.get("rerank_model", _DEFAULT_RERANK_MODEL))
+
     if top_k <= 0:
         raise ValueError("top_k must be a positive integer")
     if not candidates:
         return []
     
-    cfg = get_config()
-    model = str(model or cfg.get("cross_encoder_model"))
-    reranker = _get_reranker(model)
+    reranker = _get_reranker(rerank_model)
 
-    pairs = [(query, item["text"]) for item in candidates if item.get("text")]
+    valid_candidates = [item for item in candidates if item.get("text")]
+    pairs = [(query, item["text"]) for item in valid_candidates]
     reranked = []
 
     scores = reranker.predict(pairs)
 
-    for item, score in zip(candidates, scores, strict=True):
+    for item, score in zip(valid_candidates, scores, strict=True):
         result = dict(item)
-        result["rerank_score"] = score
-        result["score"] = score
+        result["rerank_score"] = float(score)
+        result["score"] = float(score)
         result["retrieval_source"] = "rerank"
         reranked.append(result)
 
@@ -817,20 +834,36 @@ def rerank(
 def retrieve_with_rerank(
     query: str,
     chunks: List[PdfChunk] | None = None,
-    top_k: int = 5,
-    candidate_k: int = 20,
+    top_k: int | None = None,
+    candidate_k: int | None = None,
     collection_name: str | None = None,
     model: str | None = None,
-    rerank_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+    rerank_model: str | None = None,
 ) -> List[RerankedResult]:
-    candidates = hybrid_search_pdf_chunks(query, chunks, candidate_k, collection_name, model)
-    rerank_results = rerank(query, candidates, top_k, rerank_model)
+    cfg = get_config()
+    top_k = top_k if top_k is not None else int(cfg.get("rerank_top_k", 5))
+    candidate_k = candidate_k if candidate_k is not None else int(cfg.get("rerank_candidate_k", 20))
+
+    candidates = hybrid_search_pdf_chunks(
+        query=query,
+        chunks=chunks,
+        top_k=candidate_k,
+        collection_name=collection_name,
+        model=model,
+    )
+    rerank_results = rerank(
+        query=query,
+        candidates=candidates,
+        top_k=top_k,
+        rerank_model=rerank_model,
+    )
 
     return rerank_results
 
 
-def build_context(rerank_results: List[RerankedResult]) -> str:
+def build_context(rerank_results: List[RerankedResult], max_chars: int = 6000) -> str:
     blocks = []
+    used_chars = 0
     
     for index, item in enumerate(rerank_results, start=1):
         source = item.get("source", "")
@@ -838,6 +871,10 @@ def build_context(rerank_results: List[RerankedResult]) -> str:
         page_end = item.get("page_end", "")
         heading = item.get("heading", "")
         text = item.get("text", "").strip()
+        
+        if not text:
+            continue
+
         block = (
             f"[{index}]\n"
             f"Source: {source}\n"
@@ -845,10 +882,13 @@ def build_context(rerank_results: List[RerankedResult]) -> str:
             f"heading: {heading}\n"
             f"text: {text}\n"
         )
-        if not text:
-            continue
+        next_size = len(block) + 2
+        if used_chars + next_size > max_chars:
+            break
 
         blocks.append(block)
+        used_chars += next_size
+        
     return "\n\n".join(blocks)
 
 
@@ -893,9 +933,9 @@ Answer:
 def call_llm(prompt: str) -> str:
     cfg = get_config()
 
-    base_url = str(cfg.get("llm_url", ""))
-    model = str(cfg.get("llm_model", ""))
-    llm_api_key_env = str(cfg.get("llm_api_key_env", ""))
+    base_url = str(cfg.get("llm_url", "https://api.deepseek.com"))
+    model = str(cfg.get("llm_model", "deepseek-chat"))
+    llm_api_key_env = str(cfg.get("llm_api_key_env", "DEEPSEEK_API_KEY"))
 
     api_key = os.getenv(llm_api_key_env, "")
     if not api_key:
@@ -907,8 +947,55 @@ def call_llm(prompt: str) -> str:
     )
 
     response = client.responses.create(
-        model=cfg.get("llm_model"),
+        model=model,
         input=[{"role": "user", "content": prompt,}],
     )
 
     return response.output_text
+
+def answer(
+    query: str,
+    candidate_k: int | None = None,
+    embed_model: str | None = None,
+    rerank_model: str | None = None,
+    top_k: int | None = None,
+    collection_name: str | None = None,
+    max_context_chars: int | None = None,
+) -> AnswerResult:
+    cfg = get_config()
+    candidate_k = candidate_k if candidate_k is not None else int(cfg.get("rerank_candidate_k", 20))
+    top_k = top_k if top_k is not None else int(cfg.get("rerank_top_k", 5))
+    collection_name = str(collection_name or cfg.get("collection_name"))
+    embed_model = str(embed_model or cfg.get("embed_model"))
+    rerank_model = str(rerank_model or cfg.get("rerank_model"))
+    max_context_chars = max_context_chars if max_context_chars is not None else int(cfg.get("max_context_chars", 6000))
+
+    rerank_results = retrieve_with_rerank(
+        query=query,
+        top_k=top_k,
+        candidate_k=candidate_k,
+        collection_name=collection_name,
+        model=embed_model,
+        rerank_model=rerank_model,
+    )
+    context = build_context(rerank_results, max_chars=max_context_chars)
+    prompt = build_prompt(context, query)
+    answer_text = call_llm(prompt)
+
+    sources: List[AnswerSource] = [
+        {
+            "source": item["source"],
+            "chunk_index": item["chunk_index"],
+            "page_start": item["page_start"],
+            "page_end": item["page_end"],
+            "heading": item["heading"],
+            "score": item["score"],
+            "retrieval_source": item["retrieval_source"],
+        }
+        for item in rerank_results
+    ]
+    return {
+        "query": query,
+        "answer": answer_text,
+        "sources": sources,
+    }
