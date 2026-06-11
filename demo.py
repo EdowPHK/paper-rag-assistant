@@ -890,7 +890,7 @@ Answer:
 
     return prompt
 
-def call_llm(prompt: str) -> None:
+def call_llm(prompt: str) -> str:
     cfg = get_config()
 
     base_url = str(cfg.get("llm_url", ""))
