@@ -493,6 +493,51 @@ def upsert_pdf_chunks(
     client.upsert(collection_name=collection_name, points=points)
 
 
+def upsert_pdf_sentences(
+    items: List[EmbeddedPdfSentence],
+    collection_name: str | None = None,
+) -> None:
+    if not items:
+        return
+    
+    cfg = get_config()
+    collection_name = str(collection_name or cfg.get("collection_name"))
+    _create_collection(collection_name, str(cfg.get("embed_model")))
+    client = _get_qdrant_client(cfg)
+
+    points = [
+        models.PointStruct(
+            id=f'{item["source"]}:{item["page_id"]}:{index}',
+            vector=item["embedding"],
+            payload={
+                "source": item["source"],
+                "page_id": item["page_id"],
+                "heading": item["heading"],
+                "sentence": item["sentence"],
+            },
+        )
+        for index, item in enumerate(items)
+    ]
+
+    client.upsert(collection_name=collection_name, points=points)
+
+
+def index_pdf(pdf_path: str, collection_name: str | None = None, model: str | None = None) -> IndexResult:
+    cfg = get_config()
+    collection_name = str(collection_name or cfg.get("collection_name"))
+    model = str(model or cfg.get("embed_model"))
+    pages = parse_pdf_to_pages(pdf_path)
+    chunks = split_pdf_pages_into_chunks(pages, model=model)
+    embedded_items = embed_pdf_chunks(chunks, model=model)
+    upsert_pdf_chunks(embedded_items, collection_name=collection_name, model=model)
+    return {
+        "source": os.path.basename(pdf_path),
+        "pages": len(pages),
+        "chunks": len(embedded_items),
+        "collection_name": collection_name,
+    }
+
+
 def _payload_to_retrieval_result(
     payload: Dict[str, Any],
     score: float,
@@ -772,47 +817,67 @@ def retrieve_with_rerank(
 
     return rerank_results
 
-def upsert_pdf_sentences(
-    items: List[EmbeddedPdfSentence],
-    collection_name: str | None = None,
-) -> None:
-    if not items:
-        return
+
+def build_context(rerank_results: List[RerankedResult]) -> str:
+    blocks = []
     
-    cfg = get_config()
-    collection_name = str(collection_name or cfg.get("collection_name"))
-    _create_collection(collection_name, str(cfg.get("embed_model")))
-    client = _get_qdrant_client(cfg)
-
-    points = [
-        models.PointStruct(
-            id=f'{item["source"]}:{item["page_id"]}:{index}',
-            vector=item["embedding"],
-            payload={
-                "source": item["source"],
-                "page_id": item["page_id"],
-                "heading": item["heading"],
-                "sentence": item["sentence"],
-            },
+    for index, item in enumerate(rerank_results, start=1):
+        source = item.get("source", "")
+        page_start = item.get("page_start", "")
+        page_end = item.get("page_end", "")
+        heading = item.get("heading", "")
+        text = item.get("text", "").strip()
+        block = (
+            f"[{index}]\n"
+            f"Source: {source}\n"
+            f"Pages: {page_start}-{page_end}\n"
+            f"heading: {heading}\n"
+            f"text: {text}\n"
         )
-        for index, item in enumerate(items)
-    ]
+        if not text:
+            continue
 
-    client.upsert(collection_name=collection_name, points=points)
+        blocks.append(block)
+    return "\n\n".join(blocks)
 
 
-def index_pdf(pdf_path: str, collection_name: str | None = None, model: str | None = None) -> IndexResult:
-    cfg = get_config()
-    collection_name = str(collection_name or cfg.get("collection_name"))
-    model = str(model or cfg.get("embed_model"))
-    pages = parse_pdf_to_pages(pdf_path)
-    chunks = split_pdf_pages_into_chunks(pages, model=model)
-    embedded_items = embed_pdf_chunks(chunks, model=model)
-    upsert_pdf_chunks(embedded_items, collection_name=collection_name, model=model)
-    return {
-        "source": os.path.basename(pdf_path),
-        "pages": len(pages),
-        "chunks": len(embedded_items),
-        "collection_name": collection_name,
-    }
+def build_prompt(context: str, query: str) -> str:
+    # 1. 系统/角色说明
+    instruction = """
+你是一个论文回答助手。
+你只能基于给定 Context 回答问题。
+如果 Context 中没有足够证据，就明确说“根据当前论文内容无法回答”。
+回答时必须使用[1]、[2]这样的引用编号。
+不要编造论文中没有出现的信息。
+""".strip()
+    
+    # 2. 用户问题
+    question_block = f"""
+Question:
+{query}
+""".strip()
+    
+    # 3. 检索上下文
+    context_block = f"""
+Context:
+{context}
+""".strip()
+    
+    # 4. 输出要求
+    output_format = """
+Answer:
+请给出简洁、准确的回答，并在关键结论后附上引用编号。
+""".strip()
+    
+    # 5. 拼成最终 prompt
+    prompt = "\n\n".join([
+        instruction,
+        question_block,
+        context_block,
+        output_format,
+    ])
 
+    return prompt
+
+def call_llm(prompt: str) -> None:
+    
