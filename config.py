@@ -1,18 +1,19 @@
 from typing import Dict
-import json
 import os
 
-_CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config.json")
+import yaml
+
+_CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config.yaml")
 _CONFIG_CACHE: Dict[str, object] = {}
 
-def _load_config(path: str = _CONFIG_PATH) -> Dict[str, str]:
+def _load_config(path: str = _CONFIG_PATH) -> Dict[str, object]:
     try:
         with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
+            return yaml.safe_load(f) or {}
     except FileNotFoundError as exc:
         raise ValueError(f"Missing config file: {path}") from exc
-    except json.JSONDecodeError as exc:
-        raise ValueError(f"Invalid JSON in config file: {path}") from exc
+    except yaml.YAMLError as exc:
+        raise ValueError(f"Invalid YAML in config file: {path}") from exc
     
 def get_qdrant_apikey() -> str:
     return os.getenv("QDRANT_API_KEY", "").strip()
@@ -43,4 +44,3 @@ def get_config() -> Dict[str, object]:
         "llm_url": str(raw.get("llm_url", raw.get("llm_base_url", "https://api.deepseek.com"))),
     }
     return _CONFIG_CACHE
-

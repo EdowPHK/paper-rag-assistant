@@ -167,26 +167,24 @@ Hybrid Search 负责召回候选，Cross-Encoder 负责精排：
 
 ## 配置
 
-项目使用 `config.json` 管理非敏感配置，API key 通过环境变量传入。
+项目使用 `config.yaml` 管理非敏感配置，API key 通过环境变量传入。
 
 示例：
 
-```json
-{
-  "qdrant_url": "https://your-qdrant-url:6333",
-  "collection_name": "knowledge_base",
-  "embed_model": "all-MiniLM-L6-v2",
-  "embed_text_batch_size": 32,
-  "chunk_target_tokens": 220,
-  "chunk_overlap_tokens": 40,
-  "rerank_model": "cross-encoder/ms-marco-MiniLM-L-6-v2",
-  "rerank_candidate_k": 20,
-  "rerank_top_k": 5,
-  "max_context_chars": 6000,
-  "llm_model": "deepseek-chat",
-  "llm_api_key_env": "DEEPSEEK_API_KEY",
-  "llm_url": "https://api.deepseek.com"
-}
+```yaml
+qdrant_url: "https://your-qdrant-url:6333"
+collection_name: "knowledge_base"
+embed_model: "all-MiniLM-L6-v2"
+embed_text_batch_size: 32
+chunk_target_tokens: 220
+chunk_overlap_tokens: 40
+rerank_model: "cross-encoder/ms-marco-MiniLM-L-6-v2"
+rerank_candidate_k: 20
+rerank_top_k: 5
+max_context_chars: 6000
+llm_model: "deepseek-chat"
+llm_api_key_env: "DEEPSEEK_API_KEY"
+llm_url: "https://api.deepseek.com"
 ```
 
 环境变量：
@@ -198,12 +196,10 @@ export DEEPSEEK_API_KEY="your-llm-api-key"
 
 如果使用其他 OpenAI-compatible 服务，可以修改：
 
-```json
-{
-  "llm_model": "your-model",
-  "llm_api_key_env": "YOUR_API_KEY_ENV",
-  "llm_url": "https://your-openai-compatible-base-url"
-}
+```yaml
+llm_model: "your-model"
+llm_api_key_env: "YOUR_API_KEY_ENV"
+llm_url: "https://your-openai-compatible-base-url"
 ```
 
 ## 安装
@@ -220,6 +216,7 @@ pip install -r requirements.txt
 sentence-transformers
 qdrant-client
 pymupdf
+PyYAML
 ```
 
 如果使用 LLM 调用，还需要确保安装 OpenAI SDK：

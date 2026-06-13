@@ -10,7 +10,7 @@ def _get_qdrant_client(config: Dict[str, str]) -> QdrantClient:
     url = config.get("qdrant_url", "").strip()
     api_key = config.get("qdrant_api_key", "").strip()
     if not url or not api_key:
-        raise ValueError("qdrant_url and qdrant_api_key must be set in config.json")
+        raise ValueError("qdrant_url and qdrant_api_key must be set in config.yaml")
     return QdrantClient(url=url, api_key=api_key)
 
 def _create_collection(collection_name: str | None = None, model: str | None = None) -> None:
