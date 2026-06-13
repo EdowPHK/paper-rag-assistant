@@ -1,4 +1,5 @@
-qdrant_url: "https://fc507a81-d2f2-44ec-aa35-3ddf76db1827.australia-southeast1-0.gcp.cloud.qdrant.io:6333"
+qdrant_url: "https://fda4f126-11fc-449f-9800-15aa7060e784.australia-southeast1-0.gcp.cloud.qdrant.io:6333"
+qdrant_api_key_env: "QDRANT_API_KEY"
 collection_name: "knowledge_base"
 embed_model: "all-MiniLM-L6-v2"
 embed_text_batch_size: 32

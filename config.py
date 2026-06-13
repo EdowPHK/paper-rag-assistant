@@ -15,8 +15,8 @@ def _load_config(path: str = _CONFIG_PATH) -> Dict[str, object]:
     except yaml.YAMLError as exc:
         raise ValueError(f"Invalid YAML in config file: {path}") from exc
     
-def get_qdrant_apikey() -> str:
-    return os.getenv("QDRANT_API_KEY", "").strip()
+def get_qdrant_apikey(env_name: str = "QDRANT_API_KEY") -> str:
+    return os.getenv(env_name, "").strip()
 
 def get_config() -> Dict[str, object]:
     global _CONFIG_CACHE
@@ -27,9 +27,12 @@ def get_config() -> Dict[str, object]:
     except ValueError:
         raw = {}
         
+    qdrant_api_key_env = str(raw.get("qdrant_api_key_env", "QDRANT_API_KEY"))
+
     _CONFIG_CACHE = {
         "qdrant_url": raw.get("qdrant_url", ""),
-        "qdrant_api_key": get_qdrant_apikey(),
+        "qdrant_api_key": get_qdrant_apikey(qdrant_api_key_env),
+        "qdrant_api_key_env": qdrant_api_key_env,
         "collection_name": raw.get("collection_name", "knowledge_base"),
         "embed_model": raw.get("embed_model", "all-MiniLM-L6-v2"),
         "embed_text_batch_size": int(raw.get("embed_text_batch_size", 32)),

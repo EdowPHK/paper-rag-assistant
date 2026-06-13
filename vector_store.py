@@ -1,4 +1,6 @@
 from typing import List, Dict, Any
+import uuid
+
 from qdrant_client import QdrantClient, models
 from qdrant_client.models import VectorParams
 
@@ -6,11 +8,19 @@ from config import get_config
 from embeddings import get_encoder
 from schemas import EmbeddedPdfChunk, PdfChunk, RetrievalResult
 
+
+def _qdrant_point_id(chunk_id: str) -> str:
+    try:
+        return str(uuid.UUID(chunk_id))
+    except ValueError:
+        return str(uuid.uuid5(uuid.NAMESPACE_URL, f"paper-rag-assistant:{chunk_id}"))
+
+
 def _get_qdrant_client(config: Dict[str, str]) -> QdrantClient:
     url = config.get("qdrant_url", "").strip()
     api_key = config.get("qdrant_api_key", "").strip()
     if not url or not api_key:
-        raise ValueError("qdrant_url and qdrant_api_key must be set in config.yaml")
+        raise ValueError("qdrant_url must be set in config.yaml and QDRANT_API_KEY must be set in the environment")
     return QdrantClient(url=url, api_key=api_key)
 
 def _create_collection(collection_name: str | None = None, model: str | None = None) -> None:
@@ -49,7 +59,7 @@ def upsert_pdf_chunks(
 
     points = [
         models.PointStruct(
-            id=item["chunk_id"],
+            id=_qdrant_point_id(item["chunk_id"]),
             vector=item["embedding"],
             payload={
                 "source": item["source"],
@@ -176,7 +186,7 @@ def search_vectors(
     cfg = get_config()
     collection_name = str(collection_name or cfg.get("collection_name"))
 
-    client = _get_qdrant_client()
+    client = _get_qdrant_client(cfg)
     points = _query_qdrant(client, collection_name, query_vector, top_k)
 
     return [

@@ -1,9 +1,9 @@
-config.json
-
 data/
 __pycache__/
 .vscode/
 .agents/
 .codex/
+web/
 
 *.pyc
+web_app.py
